@@ -10,7 +10,8 @@ Keine Secrets sind in diesem Dokument enthalten. Passwörter, Long-Lived-Tokens 
 - OCPP liefert Status, Ladeleistung, Strom, Spannung und Session-Energie.
 - Home Assistant startet/stoppt den Ladevorgang über OCPP.
 - Die Phasenumschaltung wird nicht über OCPP bereitgestellt, sondern über die lokale Elli-WebGUI/API.
-- Home Assistant kann dadurch abhängig vom PV-Überschuss zwischen 1-phasigem und 3-phasigem Laden wechseln.
+- Home Assistant kann dadurch abhängig vom echten PV-Überschuss zwischen 1-phasigem und 3-phasigem Laden wechseln.
+- Für echtes PV-only-Laden sollte zusätzlich die Batterie-Leistung betrachtet werden, nicht nur der Netzbezug.
 
 ## Relevante Komponenten
 
@@ -44,6 +45,7 @@ sensor.strombezug
 sensor.aktueller_gesamtverbrauch
 sensor.pv_power
 sensor.battery_state_of_charge
+sensor.battery_power                  Hausbatterie-Leistung; Vorzeichen je nach Integration prüfen
 ```
 
 ## OCPP-MeterValues konfigurieren
@@ -95,6 +97,32 @@ SupportedFeatureProfiles: Core, FirmwareManagement, LocalAuthListManagement, Res
 ```
 
 Ein Versuch, `ConnectorSwitch3to1PhaseSupported` per `ocpp.configure` auf `true` zu setzen, wurde nicht wirksam übernommen. Daher ist die lokale Elli-API der bessere Weg.
+
+
+## PV-only statt nur „kein Netzbezug“
+
+„Kein Netzbezug“ ist für PV-Überschussladen nicht automatisch ausreichend. Wenn eine Hausbatterie vorhanden ist, kann diese das Auto stützen; der Netzbezug bleibt dann bei 0 W, obwohl das Auto indirekt aus der Batterie lädt.
+
+Besser ist daher eine PV-only-Regel über die Batterieleistung. In der hier getesteten GoodWe-Integration gilt:
+
+```text
+sensor.battery_power < 0 W   Batterie lädt
+sensor.battery_power > 0 W   Batterie entlädt
+```
+
+Das Vorzeichen muss pro Installation geprüft werden.
+
+Bewährte Grundlogik:
+
+```text
+Start erlauben: Batterie lädt deutlich, z. B. battery_power < -1500 W
+Stop erzwingen: Batterie entlädt, z. B. battery_power > 100 W
+Stop erzwingen: Netzbezug > 250 W
+Stop erzwingen: Batterie-SoC < 30 %
+3p nur erlauben: sehr viel Überschuss, z. B. battery_power < -5000 W und SoC >= 40 %
+```
+
+Damit wird nicht nur Netzbezug vermieden, sondern auch das Leersaugen der Hausbatterie.
 
 ## Lokale Elli-WebGUI/API
 
@@ -391,10 +419,12 @@ sensor.wallbox_phase_state
 Grundidee:
 
 - Stoppen bei Netzbezug oder Batterie unter 30 %.
-- Starten ab Batterie 30 %, wenn echter PV-Überschuss vorhanden ist.
-- 1-phasig bei wenig verfügbarer Leistung, z. B. rund 1,4-3,7 kW.
-- 3-phasig bei viel verfügbarer Leistung.
-- Umschalten nur über Stop → Phase setzen → Start.
+- Starten ab Batterie 30 %, wenn die Batterie bereits deutlich lädt.
+- Stoppen, sobald die Batterie entlädt oder Netzbezug entsteht.
+- 1-phasig bei wenig verfügbarem PV-Überschuss, z. B. rund 1,4-3,7 kW.
+- 3-phasig nur bei sehr viel PV-Überschuss, z. B. Batterie lädt mit >5 kW und SoC >= 40 %.
+- Umschalten nur über Stop → Phase setzen → bestätigten Phasenstatus abwarten → Start.
+- Wenn der gewünschte Phasenstatus nicht bestätigt wird, nicht starten.
 
 Beispiel-Entscheidung:
 
@@ -407,6 +437,42 @@ Beispiel-Entscheidung:
 ```
 
 Warum `ladeleistung` wieder addieren? `aktueller_gesamtverbrauch` enthält in vielen Installationen bereits die Wallbox. Für die Frage „wie viel wäre fürs Auto verfügbar?“ muss die aktuelle Autolast daher wieder herausgerechnet werden.
+
+
+## Wichtiger Automationshinweis: Phasenwechsel und Start trennen
+
+Ein robuster Ablauf ist zweistufig:
+
+1. Wenn PV-only-Laden erlaubt wäre, aber die Wallbox noch nicht in der Zielphase ist, nur die Phase anfordern und dann beenden.
+2. Erst in einem späteren Lauf starten, wenn `sensor.wallbox_phase_state` wirklich `onePhase` oder `threePhase` passend zur Zielphase meldet.
+
+Dadurch startet die Wallbox nicht versehentlich 3-phasig, wenn der 1p-Umschaltbefehl von der Elli mit `422` abgelehnt wurde.
+
+Beispielbedingungen:
+
+```yaml
+# Phase anfordern, aber noch nicht starten
+- condition: template
+  value_template: >-
+    {{ charge_switch == 'off'
+       and fahrzeug_angesteckt
+       and netzbezug_w < 50
+       and batterie_soc >= 30
+       and batterie_power_w < -1500
+       and wallbox_phase != zielphase }}
+```
+
+```yaml
+# Nur starten, wenn die Zielphase bestätigt ist
+- condition: template
+  value_template: >-
+    {{ charge_switch == 'off'
+       and fahrzeug_angesteckt
+       and netzbezug_w < 50
+       and batterie_soc >= 30
+       and batterie_power_w < -1500
+       and wallbox_phase == zielphase }}
+```
 
 ## Typische Schwellwerte
 
@@ -475,4 +541,6 @@ switch.charger_charge_control
 - `/charging/phase-type/selected` ist nicht zwingend der aktuelle Relaiszustand.
 - Der operative Live-Zustand steht unter `/system/relais-switch/state`.
 - Während aktiver Ladung sollte nicht direkt umgeschaltet werden.
+- Home Assistant `shell_command` signalisiert Fehler nicht automatisch als Abbruch für die restliche Automation. Deshalb sollte eine Automation Laden und Phasenwechsel trennen: erst Phase anfordern, später nur starten, wenn `sensor.wallbox_phase_state` die Zielphase bestätigt.
+- Phasenwechsel nicht blind alle 30 Sekunden erneut versuchen. Bei Elli kann ein blockierter 1p-Wechsel sonst Log-Spam und Timeout-Spam erzeugen. Besser nur bei Status-/Überschussereignissen erneut versuchen.
 

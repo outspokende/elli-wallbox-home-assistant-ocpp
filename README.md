@@ -237,9 +237,11 @@ Wichtig: In Automationen sollte man nicht hart während aktiver Ladung umschalte
 
 1. Ladevorgang stoppen
 2. Phase setzen
-3. einige Sekunden warten
+3. Status pollen, bis `onePhase` oder `threePhase` wirklich erreicht ist
 4. Ladestromlimit setzen
 5. Ladevorgang wieder starten
+
+Die Elli-API kann beim `PUT /system/relais-switch/state` während des Umschaltens HTTP `422` zurückgeben, obwohl der Relaiswechsel anschließend weiterläuft. Direkt danach kann `/system/relais-switch/state` den Zwischenzustand `switchInProgress` melden. Deshalb sollte ein Script nicht allein den HTTP-Code des `PUT` als finale Wahrheit verwenden, sondern danach den Status-Endpunkt pollen.
 
 ## Beispiel: Home-Assistant-Script für lokale API
 
@@ -272,6 +274,12 @@ if [ -z "$TOKEN" ]; then
   exit 2
 fi
 
+get_state() {
+  curl -fsS --max-time 8 \
+    -H "Authorization: $TOKEN" \
+    "$BASE/api/v2/system/relais-switch/state"
+}
+
 case "$PHASE" in
   state)
     curl -fsS --max-time 8 \
@@ -279,12 +287,36 @@ case "$PHASE" in
       "$BASE/api/v2/system/relais-switch/state"
     ;;
   onePhase|threePhase)
-    curl -fsS --max-time 12 \
-      -X PUT \
+    current=$(get_state | /usr/local/bin/python3 -c 'import sys,json; print(json.load(sys.stdin).get("value","unknown"))')
+    if [ "$current" = "$PHASE" ]; then
+      echo "{\"value\":\"$current\"}"
+      exit 0
+    fi
+
+    tmp=/tmp/wallbox_phase_response.$$
+    code=$(curl -s --max-time 12 -o "$tmp" -w '%{http_code}' -X PUT \
       -H "Authorization: $TOKEN" \
       -H "Content-Type: application/json" \
       -d "{\"value\":\"$PHASE\"}" \
-      "$BASE/api/v2/system/relais-switch/state"
+      "$BASE/api/v2/system/relais-switch/state" || true)
+
+    # Elli may return 422 while the relay transition is already in progress.
+    # Poll the state endpoint and treat that as authoritative.
+    i=0
+    while [ $i -lt 12 ]; do
+      sleep 5
+      current=$(get_state | /usr/local/bin/python3 -c 'import sys,json; print(json.load(sys.stdin).get("value","unknown"))' || echo unknown)
+      if [ "$current" = "$PHASE" ]; then
+        echo "{\"value\":\"$current\"}"
+        rm -f "$tmp"
+        exit 0
+      fi
+      i=$((i+1))
+    done
+
+    echo "phase switch to $PHASE not completed; http=$code; current=$current; body=$(cat "$tmp" 2>/dev/null)" >&2
+    rm -f "$tmp"
+    exit 22
     ;;
   *)
     echo "usage: $0 state|onePhase|threePhase" >&2
@@ -359,8 +391,8 @@ sensor.wallbox_phase_state
 Grundidee:
 
 - Stoppen bei Netzbezug oder Batterie unter 30 %.
-- Starten erst ab Batterie 32 %.
-- 1-phasig bei wenig verfügbarer Leistung.
+- Starten ab Batterie 30 %, wenn echter PV-Überschuss vorhanden ist.
+- 1-phasig bei wenig verfügbarer Leistung, z. B. rund 1,4-3,7 kW.
 - 3-phasig bei viel verfügbarer Leistung.
 - Umschalten nur über Stop → Phase setzen → Start.
 

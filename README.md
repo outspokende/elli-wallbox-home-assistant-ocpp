@@ -117,12 +117,12 @@ Bewährte Grundlogik:
 ```text
 Start erlauben: Batterie lädt deutlich, z. B. battery_power < -1500 W
 Stop erzwingen: Batterie entlädt, z. B. battery_power > 100 W
-Stop erzwingen: Netzbezug > 250 W
+Stop erzwingen: Netzbezug > 500 W
 Stop erzwingen: Batterie-SoC < 30 %
 3p nur erlauben: sehr viel Überschuss, z. B. battery_power < -5000 W und SoC >= 40 %
 ```
 
-Damit wird nicht nur Netzbezug vermieden, sondern auch das Leersaugen der Hausbatterie.
+Damit wird das Leersaugen der Hausbatterie vermieden. In der Praxis kann man eine kleine Netzbezugstoleranz setzen; bis zu ca. 500 W kurzzeitiger Netzbezug sind oft sinnvoller als zu aggressives Takten.
 
 ## Lokale Elli-WebGUI/API
 
@@ -456,7 +456,7 @@ Beispielbedingungen:
   value_template: >-
     {{ charge_switch == 'off'
        and fahrzeug_angesteckt
-       and netzbezug_w < 50
+       and netzbezug_w < 500
        and batterie_soc >= 30
        and batterie_power_w < -1500
        and wallbox_phase != zielphase }}
@@ -468,7 +468,7 @@ Beispielbedingungen:
   value_template: >-
     {{ charge_switch == 'off'
        and fahrzeug_angesteckt
-       and netzbezug_w < 50
+       and netzbezug_w < 500
        and batterie_soc >= 30
        and batterie_power_w < -1500
        and wallbox_phase == zielphase }}
